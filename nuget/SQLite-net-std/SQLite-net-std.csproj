@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>netstandard2.0</TargetFramework>
@@ -10,7 +10,7 @@
       This version uses SQLitePCLRaw to provide platform independent versions of SQLite.
 
     </Description>
-    <Version>1.5.169-beta</Version>
+    <Version>1.5.170-beta</Version>
 
   </PropertyGroup>
 
@@ -27,7 +27,7 @@
     <DocumentationFile>bin\Debug\netstandard2.0\SQLite-net.xml</DocumentationFile>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="SQLitePCLRaw.bundle_green" Version="2.0.1" />
+    <PackageReference Include="SQLitePCLRaw.bundle_green" Version="1.1.8" />
   </ItemGroup>
   <ItemGroup>
     <Compile Include="..\..\src\SQLite.cs">
