@@ -5,6 +5,7 @@
     <AssemblyName>SQLite-net</AssemblyName>
     <PackageId>sqlite-net-pcl</PackageId>
     <AssemblyTitle>SQLite-net Official .NET Standard Library</AssemblyTitle>
+    <Version>1.9.173-optiq01</Version>
     <Description>
       SQLite-net is an open source and light weight library providing easy SQLite database storage for .NET, Mono, and Xamarin applications.
       This version uses SQLitePCLRaw to provide platform independent versions of SQLite.
