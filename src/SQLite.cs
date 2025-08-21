@@ -25,6 +25,7 @@
 
 using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 #if !USE_SQLITEPCL_RAW
 using System.Runtime.InteropServices;
@@ -431,6 +432,9 @@ namespace SQLite
 				throw new InvalidOperationException ("Encryption keys must be strings or byte arrays");
 			}
 			connectionString.PostKeyAction?.Invoke (this);
+
+			foreach (var handler in CustomTypeRegistry.Handlers)
+				handler.Initialize (this);
 		}
 
 		/// <summary>
@@ -714,23 +718,60 @@ namespace SQLite
 				var @virtual = fts ? "virtual " : string.Empty;
 				var @using = fts3 ? "using fts3 " : fts4 ? "using fts4 " : string.Empty;
 
-				// Build query.
-				var query = "create " + @virtual + "table if not exists \"" + map.TableName + "\" " + @using + "(\n";
-				var decls = map.Columns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks));
-				var decl = string.Join (",\n", decls.ToArray ());
-				query += decl;
-				query += ")";
-				if (map.WithoutRowId) {
-					query += " without rowid";
+				// Build query - but exclude custom type columns from initial CREATE TABLE
+				var standardColumns = map.Columns.Where (c => !c.HasCustomTypeHandler).ToArray ();
+
+				if (standardColumns.Length > 0) {
+					var query = "create " + @virtual + "table if not exists \"" + map.TableName + "\" " + @using + "(\n";
+					var decls = standardColumns.Select (p => Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks));
+					var decl = string.Join (",\n", decls.ToArray ());
+					query += decl;
+					query += ")";
+					if (map.WithoutRowId) {
+						query += " without rowid";
+					}
+
+					Execute (query);
+				}
+				else {
+					// All columns are custom types, create empty table first
+					var query = "create " + @virtual + "table if not exists \"" + map.TableName + "\" " + @using + "(temp_col INTEGER)";
+					Execute (query);
 				}
 
-				Execute (query);
+				// Add custom type columns using their specific handlers
+				foreach (var customCol in map.Columns.Where (c => c.HasCustomTypeHandler)) {
+					var handler = customCol.CustomTypeHandler;
+					var metadata = customCol.GetCustomTypeMetadata ();
+					var (addColSql, commandType) = handler.GetAddColumnSql (map.TableName, metadata);
+
+					if (!string.IsNullOrEmpty (addColSql)) {
+						if(commandType == CommandType.ExecuteScalar)
+							ExecuteScalar<int>(addColSql);
+						else
+							Execute (addColSql);
+					}
+					else {
+						// Fallback to standard ALTER TABLE
+						var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (customCol, StoreDateTimeAsTicks, StoreTimeSpanAsTicks);
+						Execute (addCol);
+					}
+
+					// Call the OnTableCreated callback
+					handler.OnTableCreated ( this, map.TableName, metadata );
+				}
+
+				// Remove temp column if we had to create one
+				if (standardColumns.Length == 0) {
+					Execute ($"ALTER TABLE \"{map.TableName}\" DROP COLUMN temp_col");
+				}
 			}
 			else {
 				result = CreateTableResult.Migrated;
 				MigrateTable (map, existingCols);
 			}
 
+			// Handle indexes for custom types
 			var indexes = new Dictionary<string, IndexInfo> ();
 			foreach (var c in map.Columns) {
 				foreach (var i in c.Indices) {
@@ -759,7 +800,28 @@ namespace SQLite
 			foreach (var indexName in indexes.Keys) {
 				var index = indexes[indexName];
 				var columns = index.Columns.OrderBy (i => i.Order).Select (i => i.ColumnName).ToArray ();
-				CreateIndex (indexName, index.TableName, columns, index.Unique);
+
+				// Check if any column in this index uses a custom type
+				var customColumn = map.Columns.FirstOrDefault (c => columns.Contains (c.Name) && c.HasCustomTypeHandler);
+				if (customColumn != null) {
+					var handler = customColumn.CustomTypeHandler;
+					var metadata = customColumn.GetCustomTypeMetadata ();
+					var (createIndexSql, commandType) = handler.GetCreateIndexSql (indexName, index.TableName, customColumn.Name, index.Unique, metadata );
+
+					if (!string.IsNullOrEmpty (createIndexSql)) {
+						if(commandType == CommandType.ExecuteScalar)
+							ExecuteScalar<int>(createIndexSql);
+						else
+							Execute (createIndexSql);
+					}
+					else {
+						// Fallback to standard index creation
+						CreateIndex (indexName, index.TableName, columns, index.Unique);
+					}
+				}
+				else {
+					CreateIndex (indexName, index.TableName, columns, index.Unique);
+				}
 			}
 
 			return result;
@@ -987,8 +1049,30 @@ namespace SQLite
 			}
 
 			foreach (var p in toBeAdded) {
-				var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks);
-				Execute (addCol);
+				if (p.HasCustomTypeHandler) {
+					var handler = p.CustomTypeHandler;
+					var metadata = p.GetCustomTypeMetadata ();
+					var (addColSql, commandType) = handler.GetAddColumnSql (map.TableName, metadata );
+
+					if (!string.IsNullOrEmpty (addColSql)) {
+						if(commandType == CommandType.ExecuteScalar)
+							ExecuteScalar<int>(addColSql);
+						else
+							Execute (addColSql);
+					}
+					else {
+						// Fallback to standard ALTER TABLE
+						var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks);
+						Execute (addCol);
+					}
+
+					// Call the OnTableCreated callback
+					handler.OnTableCreated (this, map.TableName, metadata);
+				}
+				else {
+					var addCol = "alter table \"" + map.TableName + "\" add column " + Orm.SqlDecl (p, StoreDateTimeAsTicks, StoreTimeSpanAsTicks);
+					Execute (addCol);
+				}
 			}
 		}
 
@@ -1946,7 +2030,7 @@ namespace SQLite
 				// We lock here to protect the prepared statement returned via GetInsertCommand.
 				// A SQLite prepared statement can be bound for only one operation at a time.
 				try {
-					count = insertCmd.ExecuteNonQuery (vals);
+					count = insertCmd.ExecuteNonQuery (vals, map.Columns);
 				}
 				catch (SQLiteException ex) {
 					if (SQLite3.ExtendedErrCode (this.Handle) == SQLite3.ExtendedResult.ConstraintNotNull) {
@@ -2008,12 +2092,26 @@ namespace SQLite
 					cols = map.InsertOrReplaceColumns;
 				}
 
-				insertSql = string.Format ("insert {3} into \"{0}\"({1}) values ({2})", map.TableName,
-								   string.Join (",", (from c in cols
-													  select "\"" + c.Name + "\"").ToArray ()),
-								   string.Join (",", (from c in cols
-													  select "?").ToArray ()), extra);
+				// Build column names
+				var columnNames = string.Join (",", cols.Select (c => "\"" + c.Name + "\"").ToArray ());
 
+				// Build value placeholders - use custom expressions for custom types
+				var valuePlaceholders = new List<string> ();
+				for (int i = 0; i < cols.Length; i++) {
+					var col = cols[i];
+					if (col.HasCustomTypeHandler) {
+						var handler = col.CustomTypeHandler;
+						var metadata = col.GetCustomTypeMetadata ();
+						var expression = (string)handler.GetInsertExpression ("?", metadata );
+						valuePlaceholders.Add (expression);
+					}
+					else {
+						valuePlaceholders.Add ("?");
+					}
+				}
+
+				insertSql = string.Format ("insert {3} into \"{0}\"({1}) values ({2})",
+					map.TableName, columnNames, string.Join (",", valuePlaceholders.ToArray ()), extra);
 			}
 
 			var insertCommand = new PreparedSqlLiteInsertCommand (this, insertSql);
@@ -2272,6 +2370,27 @@ namespace SQLite
 			if (r != SQLite3.Result.OK) {
 				throw SQLiteException.New (r, msg);
 			}
+		}
+
+		/// <summary>
+		/// Defines a custom type handler for use with SQLite operations
+		/// </summary>
+		/// <typeparam name="T">The custom type</typeparam>
+		/// <param name="handler">The handler that defines how to work with this type</param>
+		public void DefineCustomType<T> (CustomTypeHandler<T> handler)
+		{
+			if (CustomTypeRegistry.RegisterHandler (handler))
+				handler.Initialize (this);
+		}
+
+		/// <summary>
+		/// Gets the custom type handler for a given type
+		/// </summary>
+		/// <typeparam name="T">The custom type</typeparam>
+		/// <returns>The handler, or null if not registered</returns>
+		public CustomTypeHandler<T> GetCustomTypeHandler<T> ()
+		{
+			return CustomTypeRegistry.GetHandler<T> ();
 		}
 
 		~SQLiteConnection ()
@@ -2878,6 +2997,30 @@ namespace SQLite
 					default: throw new InvalidProgramException($"{nameof(TableMapping)} supports properties or fields only.");
 				}
 			}
+
+			/// <summary>
+			/// Gets whether this column uses a custom type handler
+			/// </summary>
+			public bool HasCustomTypeHandler => CustomTypeRegistry.HasHandler (ColumnType);
+
+			/// <summary>
+			/// Gets the custom type handler for this column, if any
+			/// </summary>
+			public ICustomTypeHandler CustomTypeHandler => CustomTypeRegistry.TryGetHandler (ColumnType, out var handler) ? handler : null;
+
+			private CustomTypeMetadata _customTypeMetadata;
+
+			/// <summary>
+			/// Gets the custom type metadata for this column, including access to custom attributes
+			/// </summary>
+			public CustomTypeMetadata GetCustomTypeMetadata ()
+			{
+				if (_customTypeMetadata == null) {
+					_customTypeMetadata = new CustomTypeMetadata (this);
+				}
+				return _customTypeMetadata;
+			}
+
 		}
 
 		internal enum MapMethod
@@ -2976,6 +3119,7 @@ namespace SQLite
 		public static string SqlType (TableMapping.Column p, bool storeDateTimeAsTicks, bool storeTimeSpanAsTicks)
 		{
 			var clrType = p.ColumnType;
+			
 			if (clrType == typeof (Boolean) || clrType == typeof (Byte) || clrType == typeof (UInt16) || clrType == typeof (SByte) || clrType == typeof (Int16) || clrType == typeof (Int32) || clrType == typeof (UInt32) || clrType == typeof (Int64) || clrType == typeof (UInt64)) {
 				return "integer";
 			}
@@ -3010,6 +3154,11 @@ namespace SQLite
 			}
 			else if (clrType == typeof (Guid)) {
 				return "varchar(36)";
+			}
+			else if(CustomTypeRegistry.TryGetHandler(clrType, out var handler)) 
+			{
+				var metadata = p.GetCustomTypeMetadata();
+				return handler.GetSqlType(metadata);
 			}
 			else {
 				throw new NotSupportedException ("Don't know about " + clrType);
@@ -3196,28 +3345,28 @@ namespace SQLite
 				var cols = new TableMapping.Column[SQLite3.ColumnCount (stmt)];
 				var fastColumnSetters = new Action<object, Sqlite3Statement, int>[SQLite3.ColumnCount (stmt)];
 
-				if (map.Method == TableMapping.MapMethod.ByPosition)
-				{
-					Array.Copy(map.Columns, cols, Math.Min(cols.Length, map.Columns.Length));
+				if (map.Method == TableMapping.MapMethod.ByPosition) {
+					Array.Copy (map.Columns, cols, Math.Min (cols.Length, map.Columns.Length));
 				}
 				else if (map.Method == TableMapping.MapMethod.ByName) {
 					MethodInfo getSetter = null;
-					if (typeof(T) != map.MappedType) {
-						getSetter = typeof(FastColumnSetter)
-							.GetMethod (nameof(FastColumnSetter.GetFastSetter),
+					if (typeof (T) != map.MappedType) {
+						getSetter = typeof (FastColumnSetter)
+							.GetMethod (nameof (FastColumnSetter.GetFastSetter),
 								BindingFlags.NonPublic | BindingFlags.Static).MakeGenericMethod (map.MappedType);
 					}
 
-					for (int i = 0; i < cols.Length; i++) {						
+					for (int i = 0; i < cols.Length; i++) {
 						var name = SQLite3.ColumnName16 (stmt, i);
 						cols[i] = map.FindColumn (name);
-						if (cols[i] != null)
+						if (cols[i] != null && !cols[i].HasCustomTypeHandler) {
 							if (getSetter != null) {
-								fastColumnSetters[i] = (Action<object, Sqlite3Statement, int>)getSetter.Invoke(null, new object[]{ _conn, cols[i]});
+								fastColumnSetters[i] = (Action<object, Sqlite3Statement, int>)getSetter.Invoke (null, new object[] { _conn, cols[i] });
 							}
 							else {
-								fastColumnSetters[i] = FastColumnSetter.GetFastSetter<T>(_conn, cols[i]);
+								fastColumnSetters[i] = FastColumnSetter.GetFastSetter<T> (_conn, cols[i]);
 							}
+						}
 					}
 				}
 
@@ -3232,7 +3381,8 @@ namespace SQLite
 						}
 						else {
 							var colType = SQLite3.ColumnType (stmt, i);
-							var val = ReadCol (stmt, i, colType, cols[i].ColumnType);
+							var metadata = cols[i].HasCustomTypeHandler ? cols[i].GetCustomTypeMetadata () : null;
+							var val = ReadCol (stmt, i, colType, cols[i].ColumnType, metadata);
 							cols[i].SetValue (obj, val);
 						}
 					}
@@ -3412,12 +3562,21 @@ namespace SQLite
 
 		static IntPtr NegativePointer = new IntPtr (-1);
 
-		internal static void BindParameter (Sqlite3Statement stmt, int index, object value, bool storeDateTimeAsTicks, string dateTimeStringFormat, bool storeTimeSpanAsTicks)
+		internal static void BindParameter (Sqlite3Statement stmt, 
+			int index, 
+			object value,
+			bool storeDateTimeAsTicks,
+			string dateTimeStringFormat, 
+			bool storeTimeSpanAsTicks,
+			CustomTypeMetadata metadata = null)
 		{
 			if (value == null) {
 				SQLite3.BindNull (stmt, index);
 			}
 			else {
+
+				var valueType = value.GetType();
+				
 				if (value is Int32) {
 					SQLite3.BindInt (stmt, index, (int)value);
 				}
@@ -3470,9 +3629,14 @@ namespace SQLite
 				else if (value is UriBuilder) {
 					SQLite3.BindText (stmt, index, ((UriBuilder)value).ToString (), -1, NegativePointer);
 				}
+				else if(CustomTypeRegistry.TryGetHandler (valueType, out var handler)) {
+					var bindableValue =handler.ConvertToBindableValue (value, metadata);
+
+					// Recursively bind the converted value
+					BindParameter (stmt, index, bindableValue, storeDateTimeAsTicks, dateTimeStringFormat, storeTimeSpanAsTicks, null);
+					return;
+				}
 				else {
-					// Now we could possibly get an enum, retrieve cached info
-					var valueType = value.GetType ();
 					var enumInfo = EnumCache.GetInfo (valueType);
 					if (enumInfo.IsEnum) {
 						var enumIntValue = Convert.ToInt32 (value);
@@ -3497,116 +3661,142 @@ namespace SQLite
 			public int Index { get; set; }
 		}
 
-		object ReadCol (Sqlite3Statement stmt, int index, SQLite3.ColType type, Type clrType)
+		object ReadCol (Sqlite3Statement stmt, int index, SQLite3.ColType type, Type clrType, CustomTypeMetadata metadata = null)
 		{
 			if (type == SQLite3.ColType.Null) {
 				return null;
 			}
-			else {
-				var clrTypeInfo = clrType.GetTypeInfo ();
-				if (clrTypeInfo.IsGenericType && clrTypeInfo.GetGenericTypeDefinition () == typeof (Nullable<>)) {
-					clrType = clrTypeInfo.GenericTypeArguments[0];
-					clrTypeInfo = clrType.GetTypeInfo ();
-				}
 
-				if (clrType == typeof (String)) {
-					return SQLite3.ColumnString (stmt, index);
-				}
-				else if (clrType == typeof (Int32)) {
-					return (int)SQLite3.ColumnInt (stmt, index);
-				}
-				else if (clrType == typeof (Boolean)) {
-					return SQLite3.ColumnInt (stmt, index) == 1;
-				}
-				else if (clrType == typeof (double)) {
-					return SQLite3.ColumnDouble (stmt, index);
-				}
-				else if (clrType == typeof (float)) {
-					return (float)SQLite3.ColumnDouble (stmt, index);
-				}
-				else if (clrType == typeof (TimeSpan)) {
-					if (_conn.StoreTimeSpanAsTicks) {
-						return new TimeSpan (SQLite3.ColumnInt64 (stmt, index));
-					}
-					else {
-						var text = SQLite3.ColumnString (stmt, index);
-						TimeSpan resultTime;
-						if (!TimeSpan.TryParseExact (text, "c", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.TimeSpanStyles.None, out resultTime)) {
-							resultTime = TimeSpan.Parse (text);
-						}
-						return resultTime;
-					}
-				}
-				else if (clrType == typeof (DateTime)) {
-					if (_conn.StoreDateTimeAsTicks) {
-						return new DateTime (SQLite3.ColumnInt64 (stmt, index));
-					}
-					else {
-						var text = SQLite3.ColumnString (stmt, index);
-						DateTime resultDate;
-						if (!DateTime.TryParseExact (text, _conn.DateTimeStringFormat, System.Globalization.CultureInfo.InvariantCulture, _conn.DateTimeStyle, out resultDate)) {
-							resultDate = DateTime.Parse (text);
-						}
-						return resultDate;
-					}
-				}
-				else if (clrType == typeof (DateTimeOffset)) {
-					return new DateTimeOffset (SQLite3.ColumnInt64 (stmt, index), TimeSpan.Zero);
-				}
-				else if (clrTypeInfo.IsEnum) {
-					if (type == SQLite3.ColType.Text) {
-						var value = SQLite3.ColumnString (stmt, index);
-						return Enum.Parse (clrType, value.ToString (), true);
-					}
-					else
-						return SQLite3.ColumnInt (stmt, index);
-				}
-				else if (clrType == typeof (Int64)) {
-					return SQLite3.ColumnInt64 (stmt, index);
-				}
-				else if (clrType == typeof (UInt64)) {
-					return (ulong)SQLite3.ColumnInt64 (stmt, index);
-				}
-				else if (clrType == typeof (UInt32)) {
-					return (uint)SQLite3.ColumnInt64 (stmt, index);
-				}
-				else if (clrType == typeof (decimal)) {
-					return (decimal)SQLite3.ColumnDouble (stmt, index);
-				}
-				else if (clrType == typeof (Byte)) {
-					return (byte)SQLite3.ColumnInt (stmt, index);
-				}
-				else if (clrType == typeof (UInt16)) {
-					return (ushort)SQLite3.ColumnInt (stmt, index);
-				}
-				else if (clrType == typeof (Int16)) {
-					return (short)SQLite3.ColumnInt (stmt, index);
-				}
-				else if (clrType == typeof (sbyte)) {
-					return (sbyte)SQLite3.ColumnInt (stmt, index);
-				}
-				else if (clrType == typeof (byte[])) {
-					return SQLite3.ColumnByteArray (stmt, index);
-				}
-				else if (clrType == typeof (Guid)) {
-					var text = SQLite3.ColumnString (stmt, index);
-					return new Guid (text);
-				}
-				else if (clrType == typeof (Uri)) {
-					var text = SQLite3.ColumnString (stmt, index);
-					return new Uri (text);
-				}
-				else if (clrType == typeof (StringBuilder)) {
-					var text = SQLite3.ColumnString (stmt, index);
-					return new StringBuilder (text);
-				}
-				else if (clrType == typeof (UriBuilder)) {
-					var text = SQLite3.ColumnString (stmt, index);
-					return new UriBuilder (text);
+			var clrTypeInfo = clrType.GetTypeInfo ();
+			if (clrTypeInfo.IsGenericType && clrTypeInfo.GetGenericTypeDefinition () == typeof (Nullable<>)) {
+				clrType = clrTypeInfo.GenericTypeArguments[0];
+				clrTypeInfo = clrType.GetTypeInfo ();
+			}
+
+			if (clrType == typeof (String)) {
+				return SQLite3.ColumnString (stmt, index);
+			}
+			else if (clrType == typeof (Int32)) {
+				return (int)SQLite3.ColumnInt (stmt, index);
+			}
+			else if (clrType == typeof (Boolean)) {
+				return SQLite3.ColumnInt (stmt, index) == 1;
+			}
+			else if (clrType == typeof (double)) {
+				return SQLite3.ColumnDouble (stmt, index);
+			}
+			else if (clrType == typeof (float)) {
+				return (float)SQLite3.ColumnDouble (stmt, index);
+			}
+			else if (clrType == typeof (TimeSpan)) {
+				if (_conn.StoreTimeSpanAsTicks) {
+					return new TimeSpan (SQLite3.ColumnInt64 (stmt, index));
 				}
 				else {
-					throw new NotSupportedException ("Don't know how to read " + clrType);
+					var text = SQLite3.ColumnString (stmt, index);
+					TimeSpan resultTime;
+					if (!TimeSpan.TryParseExact (text, "c", System.Globalization.CultureInfo.InvariantCulture, System.Globalization.TimeSpanStyles.None, out resultTime)) {
+						resultTime = TimeSpan.Parse (text);
+					}
+					return resultTime;
 				}
+			}
+			else if (clrType == typeof (DateTime)) {
+				if (_conn.StoreDateTimeAsTicks) {
+					return new DateTime (SQLite3.ColumnInt64 (stmt, index));
+				}
+				else {
+					var text = SQLite3.ColumnString (stmt, index);
+					DateTime resultDate;
+					if (!DateTime.TryParseExact (text, _conn.DateTimeStringFormat, System.Globalization.CultureInfo.InvariantCulture, _conn.DateTimeStyle, out resultDate)) {
+						resultDate = DateTime.Parse (text);
+					}
+					return resultDate;
+				}
+			}
+			else if (clrType == typeof (DateTimeOffset)) {
+				return new DateTimeOffset (SQLite3.ColumnInt64 (stmt, index), TimeSpan.Zero);
+			}
+			else if (clrTypeInfo.IsEnum) {
+				if (type == SQLite3.ColType.Text) {
+					var value = SQLite3.ColumnString (stmt, index);
+					return Enum.Parse (clrType, value.ToString (), true);
+				}
+				else
+					return SQLite3.ColumnInt (stmt, index);
+			}
+			else if (clrType == typeof (Int64)) {
+				return SQLite3.ColumnInt64 (stmt, index);
+			}
+			else if (clrType == typeof (UInt64)) {
+				return (ulong)SQLite3.ColumnInt64 (stmt, index);
+			}
+			else if (clrType == typeof (UInt32)) {
+				return (uint)SQLite3.ColumnInt64 (stmt, index);
+			}
+			else if (clrType == typeof (decimal)) {
+				return (decimal)SQLite3.ColumnDouble (stmt, index);
+			}
+			else if (clrType == typeof (Byte)) {
+				return (byte)SQLite3.ColumnInt (stmt, index);
+			}
+			else if (clrType == typeof (UInt16)) {
+				return (ushort)SQLite3.ColumnInt (stmt, index);
+			}
+			else if (clrType == typeof (Int16)) {
+				return (short)SQLite3.ColumnInt (stmt, index);
+			}
+			else if (clrType == typeof (sbyte)) {
+				return (sbyte)SQLite3.ColumnInt (stmt, index);
+			}
+			else if (clrType == typeof (byte[])) {
+				return SQLite3.ColumnByteArray (stmt, index);
+			}
+			else if (clrType == typeof (Guid)) {
+				var text = SQLite3.ColumnString (stmt, index);
+				return new Guid (text);
+			}
+			else if (clrType == typeof (Uri)) {
+				var text = SQLite3.ColumnString (stmt, index);
+				return new Uri (text);
+			}
+			else if (clrType == typeof (StringBuilder)) {
+				var text = SQLite3.ColumnString (stmt, index);
+				return new StringBuilder (text);
+			}
+			else if (clrType == typeof (UriBuilder)) {
+				var text = SQLite3.ColumnString (stmt, index);
+				return new UriBuilder (text);
+			}
+			else if (CustomTypeRegistry.TryGetHandler (clrType, out var handler)) 
+			{
+				// Get the raw value from SQLite
+				object rawValue = null;
+				switch (type) {
+					case SQLite3.ColType.Text:
+						rawValue = SQLite3.ColumnString (stmt, index);
+						break;
+					case SQLite3.ColType.Blob:
+						rawValue = SQLite3.ColumnByteArray (stmt, index);
+						break;
+					case SQLite3.ColType.Integer:
+						rawValue = SQLite3.ColumnInt64 (stmt, index);
+						break;
+					case SQLite3.ColType.Float:
+						rawValue = SQLite3.ColumnDouble (stmt, index);
+						break;
+				}
+
+				// Use provided metadata or create temporary one
+				if (metadata == null) {
+					throw SQLiteException.New(SQLite3.Result.Error,
+						$"No metadata was provided for the custom type {clrType.FullName}");
+				}
+
+				return handler.ConvertFromDatabaseValueInternal(rawValue, metadata);
+			}
+			else {
+				throw new NotSupportedException ("Don't know how to read " + clrType);
 			}
 		}
 	}
@@ -3858,7 +4048,7 @@ namespace SQLite
 			CommandText = commandText;
 		}
 
-		public int ExecuteNonQuery (object[] source)
+		public int ExecuteNonQuery (object[] source, TableMapping.Column[] columns)
 		{
 			if (Initialized && Statement == NullStatement) {
 				throw new ObjectDisposedException (nameof (PreparedSqlLiteInsertCommand));
@@ -3875,10 +4065,16 @@ namespace SQLite
 				Initialized = true;
 			}
 
-			//bind the values.
+			//bind the values with metadata
 			if (source != null) {
 				for (int i = 0; i < source.Length; i++) {
-					SQLiteCommand.BindParameter (Statement, i + 1, source[i], Connection.StoreDateTimeAsTicks, Connection.DateTimeStringFormat, Connection.StoreTimeSpanAsTicks);
+					var metadata = i < columns.Length && columns[i].HasCustomTypeHandler
+						? columns[i].GetCustomTypeMetadata ()
+						: null;
+
+					SQLiteCommand.BindParameter (Statement, i + 1, source[i],
+						Connection.StoreDateTimeAsTicks, Connection.DateTimeStringFormat,
+						Connection.StoreTimeSpanAsTicks, metadata);
 				}
 			}
 			r = SQLite3.Step (Statement);
@@ -4201,7 +4397,26 @@ namespace SQLite
 				throw new NotSupportedException ("Joins are not supported.");
 			}
 			else {
-				var cmdText = "select " + selectionList + " from \"" + Table.TableName + "\"";
+				string cmdText;
+
+				// Handle custom selection list for custom types
+				if (selectionList == "*") {
+					var selectItems = new List<string> ();
+					foreach (var col in Table.Columns) {
+						if (col.HasCustomTypeHandler) {
+							var handler = col.CustomTypeHandler;
+							var metadata = col.GetCustomTypeMetadata ();
+							var expression = handler.GetSelectExpression ( col.Name, metadata );
+							selectItems.Add ($"{expression} as \"{col.Name}\"");
+						}
+						else {
+							selectItems.Add ($"\"{col.Name}\"");
+						}
+					}
+					selectionList = string.Join (", ", selectItems);
+				}
+
+				cmdText = "select " + selectionList + " from \"" + Table.TableName + "\"";
 				var args = new List<object> ();
 				if (_where != null) {
 					var w = CompileExpr (_where, args);
@@ -4372,7 +4587,6 @@ namespace SQLite
 			}
 			else if (expr.NodeType == ExpressionType.MemberAccess) {
 				var mem = (MemberExpression)expr;
-
 				var paramExpr = mem.Expression as ParameterExpression;
 				if (paramExpr == null) {
 					var convert = mem.Expression as UnaryExpression;
@@ -4382,11 +4596,15 @@ namespace SQLite
 				}
 
 				if (paramExpr != null) {
-					//
-					// This is a column of our table, output just the column name
-					// Need to translate it if that column name is mapped
-					//
-					var columnName = Table.FindColumnWithPropertyName (mem.Member.Name).Name;
+					var column = Table.FindColumnWithPropertyName (mem.Member.Name);
+					if (column != null && column.HasCustomTypeHandler) {
+						// Validate LINQ usage for custom types
+						var handler = column.CustomTypeHandler;
+						var metadata = column.GetCustomTypeMetadata ();
+						handler.ValidateLinqUsage(expr, metadata);
+					}
+
+					var columnName = column?.Name ?? mem.Member.Name;
 					return new CompileResult { CommandText = "\"" + columnName + "\"" };
 				}
 				else {
@@ -5120,6 +5338,408 @@ namespace SQLite
 			Text = 3,
 			Blob = 4,
 			Null = 5
+		}
+	}
+	/// <summary>
+	/// Base class for custom attributes that provide metadata for custom type handlers
+	/// </summary>
+	[AttributeUsage (AttributeTargets.Property | AttributeTargets.Field, AllowMultiple = true)]
+	public abstract class CustomTypeAttribute : Attribute
+	{
+		/// <summary>
+		/// Gets the name/key for this attribute
+		/// </summary>
+		public abstract string AttributeName { get; }
+	}
+
+	/// <summary>
+	/// Provides access to custom attributes and their metadata
+	/// </summary>
+	public class CustomTypeMetadata
+	{
+		private readonly Dictionary<string, CustomTypeAttribute> _attributes;
+		private readonly TableMapping.Column _column;
+
+		internal CustomTypeMetadata (TableMapping.Column column)
+		{
+			_column = column;
+			_attributes = new Dictionary<string, CustomTypeAttribute> ();
+
+			// Extract custom attributes from the property/field
+			if (column.PropertyInfo != null) {
+				var customAttrs = column.PropertyInfo.GetCustomAttributes ()
+					.OfType<CustomTypeAttribute> ()
+					.ToArray ();
+
+				foreach (var attr in customAttrs) {
+					_attributes[attr.AttributeName] = attr;
+				}
+			}
+		}
+
+		/// <summary>
+		/// Gets a custom attribute by its name/key
+		/// </summary>
+		/// <typeparam name="TAttribute">The type of attribute to retrieve</typeparam>
+		/// <param name="attributeName">The name/key of the attribute</param>
+		/// <returns>The attribute instance, or null if not found</returns>
+		public TAttribute GetAttribute<TAttribute> (string attributeName) where TAttribute : CustomTypeAttribute
+		{
+			return _attributes.TryGetValue (attributeName, out var attr) ? attr as TAttribute : null;
+		}
+
+		/// <summary>
+		/// Gets a custom attribute by its type
+		/// </summary>
+		/// <typeparam name="TAttribute">The type of attribute to retrieve</typeparam>
+		/// <returns>The attribute instance, or null if not found</returns>
+		public TAttribute GetAttribute<TAttribute> () where TAttribute : CustomTypeAttribute
+		{
+			return _attributes.Values.OfType<TAttribute> ().FirstOrDefault ();
+		}
+
+		/// <summary>
+		/// Checks if an attribute exists by name/key
+		/// </summary>
+		/// <param name="attributeName">The name/key of the attribute</param>
+		/// <returns>True if the attribute exists</returns>
+		public bool HasAttribute (string attributeName)
+		{
+			return _attributes.ContainsKey (attributeName);
+		}
+
+		/// <summary>
+		/// Checks if an attribute exists by type
+		/// </summary>
+		/// <typeparam name="TAttribute">The type of attribute to check for</typeparam>
+		/// <returns>True if the attribute exists</returns>
+		public bool HasAttribute<TAttribute> () where TAttribute : CustomTypeAttribute
+		{
+			return _attributes.Values.OfType<TAttribute> ().Any ();
+		}
+
+		/// <summary>
+		/// Gets all custom attributes
+		/// </summary>
+		/// <returns>Collection of all custom attributes</returns>
+		public IEnumerable<CustomTypeAttribute> GetAllAttributes ()
+		{
+			return _attributes.Values;
+		}
+
+		/// <summary>
+		/// Gets all custom attributes of a specific type
+		/// </summary>
+		/// <typeparam name="TAttribute">The type of attributes to retrieve</typeparam>
+		/// <returns>Collection of attributes of the specified type</returns>
+		public IEnumerable<TAttribute> GetAllAttributes<TAttribute> () where TAttribute : CustomTypeAttribute
+		{
+			return _attributes.Values.OfType<TAttribute> ();
+		}
+
+		/// <summary>
+		/// Gets the underlying column information
+		/// </summary>
+		public TableMapping.Column Column => _column;
+	}
+
+	/// <summary>
+	/// Defines how to handle a custom type in SQLite operations
+	/// </summary>
+	/// <typeparam name="T">The custom type to handle</typeparam>
+	public abstract class CustomTypeHandler<T> : ICustomTypeHandler
+	{
+		public abstract void Initialize (SQLiteConnection connection);
+
+		/// <summary>
+		/// Gets the SQL type declaration for this custom type
+		/// </summary>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL type string (e.g., "TEXT", "BLOB", etc.)</returns>
+		public abstract string GetSqlType (CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Converts the custom type value to a value that can be bound to SQLite parameters
+		/// </summary>
+		/// <param name="value">The custom type value</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>Value that SQLite can bind (string, byte[], int, etc.)</returns>
+		public object ConvertToBindableValue (object value, CustomTypeMetadata metadata)
+		{
+			return ConvertToBindableValue ((T)value, metadata);
+		}
+
+		/// <summary>
+		/// Converts the custom type value to a value that can be bound to SQLite parameters
+		/// </summary>
+		/// <param name="value">The custom type value</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>Value that SQLite can bind (string, byte[], int, etc.)</returns>
+		public abstract object ConvertToBindableValue (T value, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Gets the SQL expression to use when inserting/updating values of this type
+		/// </summary>
+		/// <param name="parameterPlaceholder">The parameter placeholder (usually "?")</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL expression (e.g., "GeomFromText(?, 4326)")</returns>
+		public virtual string GetInsertExpression (string parameterPlaceholder, CustomTypeMetadata metadata)
+		{
+			return parameterPlaceholder;
+		}
+
+		/// <summary>
+		/// Gets the SQL expression to use when selecting values of this type
+		/// </summary>
+		/// <param name="columnName">The column name</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL expression (e.g., "AsText(geometry)")</returns>
+		public virtual string GetSelectExpression (string columnName, CustomTypeMetadata metadata)
+		{
+			return $"\"{columnName}\"";
+		}
+		
+
+		/// <summary>
+		/// Converts a value read from SQLite back to the custom type
+		/// </summary>
+		/// <param name="value">Value from SQLite</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>Instance of the custom type</returns>
+		public object ConvertFromDatabaseValueInternal (object value, CustomTypeMetadata metadata)
+		{
+			return ConvertFromDatabaseValue (value, metadata);
+		}
+
+		/// <summary>
+		/// Converts a value read from SQLite back to the custom type
+		/// </summary>
+		/// <param name="value">Value from SQLite</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>Instance of the custom type</returns>
+		public abstract T ConvertFromDatabaseValue (object value, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Gets the SQL command to add a column of this type to an existing table
+		/// </summary>
+		/// <param name="tableName">Name of the table</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL command to add the column, or null to use default ALTER TABLE</returns>
+		public virtual (string sql, CommandType commandType) GetAddColumnSql (string tableName, CustomTypeMetadata metadata)
+		{
+			return (null, CommandType.None); // Use default ALTER TABLE ADD COLUMN
+		}
+
+		/// <summary>
+		/// Gets the SQL command to create an index for this column type
+		/// </summary>
+		/// <param name="indexName">Name of the index</param>
+		/// <param name="tableName">Name of the table</param>
+		/// <param name="columnName">Name of the column</param>
+		/// <param name="isUnique">Whether the index should be unique</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL command to create the index, or null to use default CREATE INDEX</returns>
+		public virtual (string sql, CommandType commandType) GetCreateIndexSql (string indexName, string tableName, string columnName, bool isUnique, CustomTypeMetadata metadata)
+		{
+			return (null, CommandType.None); // Use default CREATE INDEX
+		}
+
+		/// <summary>
+		/// Called after a table is created to perform any additional setup
+		/// </summary>
+		/// <param name="connection">The SQLite connection</param>
+		/// <param name="tableName">Name of the table</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		public virtual void OnTableCreated (SQLiteConnection connection, string tableName, CustomTypeMetadata metadata)
+		{
+			// Override to perform custom setup after table creation
+		}
+
+		/// <summary>
+		/// Validates that this type should not be used in LINQ expressions
+		/// </summary>
+		/// <param name="expression">The LINQ expression</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		public virtual void ValidateLinqUsage (Expression expression, CustomTypeMetadata metadata)
+		{
+			throw new NotSupportedException ($"Custom type {typeof (T).Name} cannot be used in LINQ queries. " +
+										  $"Column '{metadata.Column.Name}' of type {typeof (T).Name} is not supported in WHERE clauses or other LINQ operations.");
+		}
+	}
+	
+	public enum CommandType
+	{
+		None = 0,
+		Execute = 1,
+		ExecuteScalar = 2
+	}
+
+	public interface ICustomTypeHandler
+	{
+		/// <summary>
+		/// Called when the custom type handler was added to a connection
+		/// or a new connection is created with the handler being already registered
+		/// </summary>
+		void Initialize (SQLiteConnection connection);
+
+		/// <summary>
+		/// Gets the SQL type declaration for this custom type
+		/// </summary>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL type string (e.g., "TEXT", "BLOB", etc.)</returns>
+		string GetSqlType (CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Converts the custom type value to a value that can be bound to SQLite parameters
+		/// </summary>
+		/// <param name="value">The custom type value</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>Value that SQLite can bind (string, byte[], int, etc.)</returns>
+		object ConvertToBindableValue (object value, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Gets the SQL expression to use when inserting/updating values of this type
+		/// </summary>
+		/// <param name="parameterPlaceholder">The parameter placeholder (usually "?")</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL expression (e.g., "GeomFromText(?, 4326)")</returns>
+		string GetInsertExpression (string parameterPlaceholder, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Gets the SQL expression to use when selecting values of this type
+		/// </summary>
+		/// <param name="columnName">The column name</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL expression (e.g., "AsText(geometry)")</returns>
+		string GetSelectExpression (string columnName, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Converts a value read from SQLite back to the custom type
+		/// </summary>
+		/// <param name="value">Value from SQLite</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>Instance of the custom type</returns>
+		object ConvertFromDatabaseValueInternal (object value, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Gets the SQL command to add a column of this type to an existing table
+		/// </summary>
+		/// <param name="tableName">Name of the table</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL command to add the column, or null to use default ALTER TABLE</returns>
+		(string sql, CommandType commandType) GetAddColumnSql (string tableName, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Gets the SQL command to create an index for this column type
+		/// </summary>
+		/// <param name="indexName">Name of the index</param>
+		/// <param name="tableName">Name of the table</param>
+		/// <param name="columnName">Name of the column</param>
+		/// <param name="isUnique">Whether the index should be unique</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		/// <returns>SQL command to create the index, or null to use default CREATE INDEX</returns>
+		(string sql, CommandType commandType) GetCreateIndexSql (string indexName, string tableName, string columnName, bool isUnique, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Called after a table is created to perform any additional setup
+		/// </summary>
+		/// <param name="connection">The SQLite connection</param>
+		/// <param name="tableName">Name of the table</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		void OnTableCreated (SQLiteConnection connection, string tableName, CustomTypeMetadata metadata);
+
+		/// <summary>
+		/// Validates that this type should not be used in LINQ expressions
+		/// </summary>
+		/// <param name="expression">The LINQ expression</param>
+		/// <param name="metadata">Metadata including column information and custom attributes</param>
+		void ValidateLinqUsage (Expression expression, CustomTypeMetadata metadata);
+	}
+
+	/// <summary>
+	/// Registry for custom type handlers
+	/// </summary>
+	public static class CustomTypeRegistry
+	{
+		private static readonly ConcurrentDictionary<string, ICustomTypeHandler> _handlers = new ConcurrentDictionary<string, ICustomTypeHandler> ();
+
+		public static IReadOnlyCollection<ICustomTypeHandler> Handlers => _handlers.Values.ToArray ();
+		
+		/// <summary>
+		/// Registers a custom type handler
+		/// </summary>
+		/// <typeparam name="T">The custom type</typeparam>
+		/// <param name="handler">The handler instance</param>
+		public static bool RegisterHandler<T> (CustomTypeHandler<T> handler)
+		{
+			return _handlers.TryAdd(typeof (T).FullName,  handler);
+		}
+
+		/// <summary>
+		/// Gets the handler for a specific type
+		/// </summary>
+		/// <typeparam name="T">The custom type</typeparam>
+		/// <returns>The handler, or null if not registered</returns>
+		public static CustomTypeHandler<T> GetHandler<T> ()
+		{
+			return _handlers.TryGetValue (typeof (T).FullName, out var handler) ? (CustomTypeHandler<T>)handler : null;
+		}
+
+		/// <summary>
+		/// Gets the handler for a specific type
+		/// </summary>
+		/// <param name="type">The custom type</param>
+		/// <param name="handler"></param>
+		/// <returns>The handler, or null if not registered</returns>
+		public static bool TryGetHandler (Type type, out ICustomTypeHandler handler)
+		{
+			var currentType = type;
+			var derivedTypes = new List<Type> ();
+
+			while (currentType != typeof(object))
+			{
+				if (_handlers.TryGetValue (currentType.FullName, out handler)) {
+
+					// _should_ we find a suitable handler for a base type, we will add these types to the dictionary
+					// to speed up future lookups
+					foreach (var typeCainElt in derivedTypes) {
+						_handlers.TryAdd(typeCainElt.FullName, handler);
+					}
+
+					return true;
+				}
+
+				if (currentType == typeof(object))
+					break;
+
+				// remember all types in the hierarchy we have checked
+				derivedTypes.Add (currentType);
+
+				currentType = currentType.BaseType;
+
+			}
+
+			handler = null;
+			return false;
+		}
+
+		/// <summary>
+		/// Checks if a type has a registered handler
+		/// </summary>
+		/// <param name="type">The type to check</param>
+		/// <returns>True if a handler is registered</returns>
+		public static bool HasHandler (Type type)
+		{
+			return _handlers.ContainsKey (type.FullName);
+		}
+
+		/// <summary>
+		/// Removes a handler registration
+		/// </summary>
+		/// <typeparam name="T">The custom type</typeparam>
+		public static void UnregisterHandler<T> ()
+		{
+			_handlers.TryRemove (typeof (T).FullName, out var __);
 		}
 	}
 }
