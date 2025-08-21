@@ -1,6 +1,6 @@
 <Project>
     <PropertyGroup>
-        <VersionPrefix>1.9</VersionPrefix>
+        <VersionPrefix>1.9.173-optiq02</VersionPrefix>
         <VersionSuffix></VersionSuffix>
 
         <PackageIcon>Logo-low.png</PackageIcon>

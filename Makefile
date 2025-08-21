@@ -13,8 +13,6 @@ pclnuget: nuget/SQLite-net-std/SQLite-net-std.csproj $(SRC)
 basenuget: nuget/SQLite-net-base/SQLite-net-base.csproj $(SRC)
 	dotnet pack -c Release -o $(PACKAGES_OUT) $<
 
-sqlciphernuget: nuget/SQLite-net-sqlcipher/SQLite-net-sqlcipher.csproj $(SRC)
-	dotnet pack -c Release -o $(PACKAGES_OUT) $<
 
 staticnuget: nuget/SQLite-net-static/SQLite-net-static.csproj $(SRC)
 	dotnet pack -c Release -o $(PACKAGES_OUT) $<
