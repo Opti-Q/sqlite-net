@@ -3123,6 +3123,7 @@ namespace SQLite
 		readonly Column _autoPk;
 		readonly Column[] _insertColumns;
 		readonly Column[] _insertOrReplaceColumns;
+		readonly Dictionary<string, Column> _columnsByName;
 
 		public TableMapping (
 #if NET8_0_OR_GREATER
@@ -3160,6 +3161,8 @@ namespace SQLite
 					cols.Add(new Column(m, createFlags));
 			}
 			Columns = cols.ToArray ();
+			_columnsByName = cols.ToDictionary (c => c.Name, c => c, StringComparer.OrdinalIgnoreCase);
+			
 			foreach (var c in Columns) {
 				if (c.IsAutoInc && c.IsPK) {
 					_autoPk = c;
@@ -3268,8 +3271,10 @@ namespace SQLite
 			if(Method != MapMethod.ByName)
 				throw new InvalidOperationException($"This {nameof(TableMapping)} is not mapped by name, but {Method}.");
 
-			var exact = Columns.FirstOrDefault (c => c.Name.ToLower () == columnName.ToLower ());
-			return exact;
+			if (_columnsByName.TryGetValue (columnName, out var col))
+				return col;
+
+			return null;
 		}
 
 		public class Column
