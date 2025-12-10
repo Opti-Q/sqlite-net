@@ -1,6 +1,6 @@
 <Project>
     <PropertyGroup>
-        <Version>1.10.0-optiq01</Version>
+        <Version>1.10.0-optiq02</Version>
 
         <PackageIcon>Logo-low.png</PackageIcon>
         <PackageProjectUrl>https://github.com/praeclarum/sqlite-net</PackageProjectUrl>
