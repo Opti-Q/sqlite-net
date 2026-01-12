@@ -4894,6 +4894,12 @@ namespace SQLite
 			if (expr == null) {
 				throw new NotSupportedException ("Expression is NULL");
 			}
+			// Handle implicit conversion operators by unwrapping them
+			if (expr is MethodCallExpression methodCall &&
+				methodCall.Method.Name == "op_Implicit") {
+				// Unwrap the implicit conversion and compile the inner expression
+				return CompileExpr (methodCall.Arguments[0], queryArgs);
+			}
 			else if (expr is BinaryExpression) {
 				var bin = (BinaryExpression)expr;
 
